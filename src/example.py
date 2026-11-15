@@ -4,7 +4,7 @@ from ttxfont import Simulator
 from ttxread import read_ttx
 
 def test_read_simulate_tokens(filename, tokens):
-    font = read_ttx(filename)
+    font = read_ttx(filename, positioning=False)
     sim = Simulator(font)
     sim.suppressed = ['ss01', 'rtlm']
     sim.set_tokens(tokens)
@@ -13,7 +13,7 @@ def test_read_simulate_tokens(filename, tokens):
     print(sim.shaped_str())
 
 def test_read_simulate_string(filename, string):
-    font = read_ttx(filename)
+    font = read_ttx(filename, positioning=False)
     sim = Simulator(font)
     sim.suppressed = ['ss01', 'rtlm']
     sim.set_string(string)
