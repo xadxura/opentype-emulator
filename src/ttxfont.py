@@ -2,6 +2,12 @@ import os
 from lxml import etree
 from datetime import datetime
 
+from gpos import (
+	GlyphPosition, GlyphAttachment, SinglePositioning, PairPositioning, MarkPositioning,
+	LigaturePositioning, ContextPositioning, positioning_application, resolve_origins, resolve_positions,
+	CursivePositioning, apply_cursive_attachment, validate_direction,
+)
+from glyphrun import ContextRule, GlyphRun
 from ttxtables import read_basic_properties, read_post
 
 def equiv(elem1, elem2):
@@ -16,25 +22,30 @@ def equiv_list(l1, l2):
 	return all([equiv(pair[0], pair[1]) for pair in zip(l1, l2)])
 
 def is_suffix_of(l1, l2):
-	return len(l1) <= len(l2) and equiv_list(l1, l2[-len(l1):])
+	return not l1 or (len(l1) <= len(l2) and equiv_list(l1, l2[-len(l1):]))
 	
 def is_prefix_of(l1, l2):
 	return len(l1) <= len(l2) and equiv_list(l1, l2[:len(l1)])
 
-def filter_glyph(glyph, font, lookup):
-	if lookup.ignore_base_glyphs and font.glyph_to_class[glyph] == BASE_GLYPH:
+def filter_glyph(glyph, font, lookup, *, glyph_class=None):
+	glyph_class = font.glyph_to_class.get(glyph, 0) if glyph_class is None else glyph_class
+	if lookup.ignore_base_glyphs and glyph_class == BASE_GLYPH:
 		return False
-	if lookup.ignore_ligatures and font.glyph_to_class[glyph] == LIGATURE_GLYPH:
+	if lookup.ignore_ligatures and glyph_class == LIGATURE_GLYPH:
 		return False
-	if lookup.ignore_marks and font.glyph_to_class[glyph] == MARK_GLYPH:
-		return False
-	if lookup.mark_class != 0 and \
-			(glyph not in font.mark_to_class or \
-				font.mark_to_class[glyph] != lookup.mark_class):
-		return False
-	if lookup.filter_set is not None and glyph not in font.index_to_glyphs[lookup.filter_set]:
-		return False
+	if glyph_class == MARK_GLYPH:
+		if lookup.ignore_marks:
+			return False
+		if lookup.filter_set is not None:
+			return glyph in font.index_to_glyphs[lookup.filter_set]
+		if lookup.mark_class != 0:
+			return font.mark_to_class.get(glyph, 0) == lookup.mark_class
 	return True
+
+def filtered_positions(tokens, font, lookup, *, start=0, end=None, run=None):
+	return [pos for pos in range(start, len(tokens) if end is None else end)
+		if filter_glyph(tokens[pos], font, lookup,
+			glyph_class=None if run is None else run.infos[pos].glyph_class)]
 
 def filter_list(l, filter):
 	return [token for token in l if filter(token)]
@@ -99,6 +110,27 @@ class MultSubstitution:
 	def __str__(self):
 		return self.input + ' -> ' + ' '.join(self.outputs)
 
+class AlternateSubstitution:
+	def __init__(self, input, outputs):
+		if not outputs:
+			raise ValueError("An alternate substitution needs at least one alternate")
+		self.input = input
+		self.outputs = outputs
+
+	def length(self):
+		return 1
+
+	def applicable(self, tokens, pos, font, lookup):
+		return pos < len(tokens) and tokens[pos] == self.input
+
+	def apply(self, tokens, pos, font, lookup, alternate_index=1):
+		tokens = tokens.copy()
+		tokens[pos] = self.outputs[alternate_index - 1]
+		return tokens, 1, [pos]
+
+	def __str__(self):
+		return self.input + ' -> {' + ' '.join(self.outputs) + '}'
+
 # Type 4
 class LigSubstitution:
 	def __init__(self, inputs, output):
@@ -111,19 +143,18 @@ class LigSubstitution:
 	def recur(self, tokens, pos, font, lookup):
 		return None
 
-	def applicable(self, tokens, pos, font, lookup):
-		return pos < len(tokens) and tokens[pos] == self.inputs[0] and \
-			is_prefix_of(self.inputs[1:], \
-				filter_list(tokens[pos+1:], lambda t : filter_glyph(t, font, lookup)))
+	def applicable(self, tokens, pos, font, lookup, run=None):
+		if pos >= len(tokens) or tokens[pos] != self.inputs[0]:
+			return False
+		posses = [pos] + filtered_positions(tokens, font, lookup, start=pos + 1, run=run)[:len(self.inputs) - 1]
+		return len(posses) == len(self.inputs) and \
+			tuple(tokens[p] for p in posses) == tuple(self.inputs) and \
+			(run is None or run.can_match(posses, lambda p: not filter_glyph(
+				tokens[p], font, lookup, glyph_class=run.infos[p].glyph_class)))
 
-	def apply(self, tokens, pos, font, lookup):
+	def apply(self, tokens, pos, font, lookup, run=None):
+		posses = [pos] + filtered_positions(tokens, font, lookup, start=pos + 1, run=run)[:len(self.inputs) - 1]
 		tokens = tokens.copy()
-		posses = [pos]
-		i = pos+1
-		while len(posses) < len(self.inputs):
-			if filter_glyph(tokens[i], font, lookup):
-				posses.append(i)
-			i += 1
 		for i in reversed(posses):
 			del tokens[i]
 		tokens.insert(pos, self.output)
@@ -132,54 +163,43 @@ class LigSubstitution:
 	def __str__(self):
 		return ' '.join(self.inputs) + ' -> ' + self.output
 
-# Type 6, Format 3
-class ChainSubstitution3:
-	def __init__(self, lefts, inputs, rights, refs):
-		self.lefts = lefts
-		self.inputs = inputs
-		self.rights = rights
-		self.refs = refs
-
-	def length(self):
-		return len(self.lefts) + len(self.inputs) + len(self.rights)
-
+# Coverage-based representation shared by GSUB types 5 and 6, all formats.
+class ChainSubstitution3(ContextRule):
 	def recur(self, tokens, pos, font, lookup):
 		posses = self.filtered_input_positions(tokens, pos, font, lookup)
 		return [(posses[p], index) for (p, index) in self.refs]
 
-	def applicable(self, tokens, pos, font, lookup):
-		if False:
-			if len(tokens) > 2 and tokens[1] == 'ch0' and lookup.index == 99 and pos == 1:
-				print(self.left)
-				print(self.input + self.right)
-				print(filter_glyph(tokens[pos], font, lookup))
-				print(tokens[:pos])
-				print(filter_list(tokens[:pos], lambda t : filter_glyph(t, font, lookup)))
-				print(tokens[pos:])
-				print(filter_list(tokens[pos:], lambda t : filter_glyph(t, font, lookup)))
-		return pos < len(tokens) and \
-			equiv(tokens[pos], self.inputs[0]) and \
-			is_suffix_of(self.lefts, filter_list(tokens[:pos], \
-				lambda t : filter_glyph(t, font, lookup))) and \
-			is_prefix_of(self.inputs[1:] + self.rights, filter_list(tokens[pos+1:], \
-				lambda t : filter_glyph(t, font, lookup)))
+	def applicable(self, tokens, pos, font, lookup, run=None):
+		def eligible(p):
+			return filter_glyph(tokens[p], font, lookup,
+				glyph_class=None if run is None else run.infos[p].glyph_class)
+		posses = self.match_positions(tokens, pos, eligible)
+		return posses is not None and (run is None or run.can_match(posses, lambda p: not eligible(p)))
 
 	def apply(self, tokens, pos, font, lookup):
-		return tokens, 0, posses
+		raise ValueError("Contextual substitutions must execute their referenced lookups")
 
-	def filtered_input_positions(self, tokens, pos, font, lookup):
-		posses = [pos]
-		for p in range(pos+1, len(tokens)):
-			if filter_glyph(tokens[p], font, lookup):
-				posses.append(p)
-		return posses[:len(self.inputs)]
+	def filtered_input_positions(self, tokens, pos, font, lookup, run=None):
+		return ([pos] + filtered_positions(tokens, font, lookup, start=pos + 1, run=run))[:len(self.inputs)]
 
-	def __str__(self):
-		lefts = ' '.join([l if isinstance(l, str) else '/'.join(l) for l in self.lefts])
-		rights = ' '.join([l if isinstance(l, str) else '/'.join(l) for l in self.rights])
-		inputs = ' '.join([l if isinstance(l, str) else '/'.join(l) for l in self.inputs])
-		refs = ' '.join([str(index) + '->' + str(lookup) for (index, lookup) in self.refs])
-		return lefts + '|' + inputs + '|' + rights + ' ---> ' + refs
+class _InputSequence:
+	def __init__(self, positions):
+		self.positions = positions
+		self.end = positions[-1] + 1
+
+	def update(self, removed, output_count):
+		anchor = removed[0]
+		positions = []
+		for p in self.positions:
+			if p == anchor:
+				positions.extend(range(anchor, anchor + output_count))
+			elif p not in removed:
+				positions.append(p - sum(r < p for r in removed) +
+					(output_count if anchor < p else 0))
+		# Ignored glyphs are not removed by ligatures; retain their exact positions.
+		self.positions = positions
+		self.end += (output_count if anchor < self.end else 0) - \
+			sum(r < self.end for r in removed)
 
 # Type 8
 class ReverseSubstitution:
@@ -188,6 +208,8 @@ class ReverseSubstitution:
 		self.inputs = inputs
 		self.rights = rights
 		self.outputs = outputs
+		if not inputs or len(inputs) != len(outputs):
+			raise ValueError("Reverse substitution coverage and outputs must have equal nonzero lengths")
 
 	def length(self):
 		return len(self.lefts) + 1 + len(self.rights)
@@ -195,15 +217,23 @@ class ReverseSubstitution:
 	def recur(self, tokens, pos, font, lookup):
 		return None
 
-	def applicable(self, tokens, pos, font, lookup):
-		return False
+	def applicable(self, tokens, pos, font, lookup, run=None):
+		return pos < len(tokens) and tokens[pos] in self.inputs and \
+			is_suffix_of(self.lefts, [tokens[p] for p in
+				filtered_positions(tokens, font, lookup, end=pos, run=run)]) and \
+			is_prefix_of(self.rights, [tokens[p] for p in
+				filtered_positions(tokens, font, lookup, start=pos + 1, run=run)])
 
 	def apply(self, tokens, pos, font, lookup):
-		print("Type 8 not implemented")
-		exit(0)
+		tokens = tokens.copy()
+		tokens[pos] = self.outputs[self.inputs.index(tokens[pos])]
+		return tokens, 1, [pos]
 
 	def __str__(self):
-		return ' '.join(self.inputs) + ' -> ' + self.output
+		lefts = ' '.join('/'.join(g) for g in self.lefts)
+		rights = ' '.join('/'.join(g) for g in self.rights)
+		return lefts + '|' + '/'.join(self.inputs) + '|' + rights + \
+			' -> ' + '/'.join(self.outputs)
 
 class GSUB_Lookup:
 	def __init__(self, index, typ):
@@ -214,7 +244,7 @@ class GSUB_Lookup:
 		self.ignore_ligatures = False
 		self.ignore_marks = False
 		self.mark_class = 0
-		self.filter_set = None
+		self.filter_set: int | None = None
 		self.substitutions = []
 
 	def add(self, substitution):
@@ -225,44 +255,75 @@ class GSUB_Lookup:
 	def reorder(self):
 		self.substitutions = sorted(self.substitutions, key=lambda s : s.length())
 
-	def apply(self, tokens, font):
-		pos = 0
+	def apply(self, tokens, font, alternate_index=1, *, run=None):
+		run = GlyphRun(tokens, font.glyph_to_class) if run is None else run
+		pos = len(tokens) - 1 if self.reverse else 0
+		direction = -1 if self.reverse else 1
 		applications = []
-		while pos < len(tokens):
-			tokens, application, jump = self.apply_at(tokens, pos, font)
+		while 0 <= pos < len(tokens):
+			if not filter_glyph(tokens[pos], font, self, glyph_class=run.infos[pos].glyph_class):
+				pos += direction
+				continue
+			tokens, application, jump = self.apply_at(tokens, pos, font,
+				_alternate_index=alternate_index, _run=run)
 			if application is not None:
 				applications.append(application)
-				pos += jump
+				pos += -1 if self.reverse else jump
 			else:
-				pos += 1
+				pos += direction
 		return tokens, applications
 
-	def apply_at(self, tokens, pos, font):
-		for substitution in sorted(self.substitutions, key=lambda s : -s.length()):
-			if substitution.applicable(tokens, pos, font, self):
-				recur = substitution.recur(tokens, pos, font, self)
-				if recur is not None:
-					if len(recur) > 0:
-						posses = substitution.filtered_input_positions(tokens, pos, font, self)
-						len_pre = len(tokens)
-						application = {'index': str(self.index), 'posses': posses, 'rule': substitution, \
-							'tokens': tokens}
-						for pos2, recurred in recur:
-							recur_lookup = font.GSUB_lookups[recurred]
-							tokens, application_recur, _ = recur_lookup.apply_at(tokens, pos2, font)
-							if application_recur is not None:
-								application['index'] += '/' + application_recur['index']
-						application['tokens'] = tokens
-						len_post = len(tokens)
-						jump = len_post-len_pre + 1
-					else:
-						application = {'index': str(self.index), 'posses': [pos], 'rule': substitution, \
-							'tokens': tokens} 
-						jump = 1
+	def apply_at(self, tokens, pos, font, _sequences=(), _depth=0, _alternate_index=1, *, _run=None):
+		if _depth >= 64:
+			raise ValueError("Contextual lookup recursion exceeds 64 levels")
+		if not 0 <= pos < len(tokens):
+			return tokens, None, 0
+		run = GlyphRun(tokens, font.glyph_to_class) if _run is None else _run
+		for substitution in self.substitutions:
+			if isinstance(substitution, (LigSubstitution, ChainSubstitution3, ReverseSubstitution)):
+				applicable = substitution.applicable(tokens, pos, font, self, run)
+			else:
+				applicable = substitution.applicable(tokens, pos, font, self)
+			if applicable:
+				if isinstance(substitution, AlternateSubstitution) and \
+						not 1 <= _alternate_index <= len(substitution.outputs):
+					continue
+				before = tokens
+				before_infos = tuple(run.infos)
+				children = []
+				if isinstance(substitution, ChainSubstitution3):
+					posses = substitution.filtered_input_positions(tokens, pos, font, self, run)
+					sequence = _InputSequence(posses)
+					for sequence_index, lookup_index in substitution.refs:
+						if sequence_index >= len(sequence.positions):
+							continue
+						if lookup_index not in font.GSUB_lookups:
+							raise ValueError("Unknown contextual lookup index: " + str(lookup_index))
+						recur_lookup = font.GSUB_lookups[lookup_index]
+						tokens, child, _ = recur_lookup.apply_at(
+							tokens, sequence.positions[sequence_index], font,
+							_sequences + (sequence,), _depth + 1, _alternate_index, _run=run)
+						if child is not None:
+							children.append(child)
+					jump = sequence.end - pos
 				else:
-					tokens, jump, posses = substitution.apply(tokens, pos, font, self)
-					application = {'index': str(self.index), 'posses': posses, 'rule': substitution, \
-						'tokens': tokens}
+					if isinstance(substitution, AlternateSubstitution):
+						tokens, jump, posses = substitution.apply(
+							tokens, pos, font, self, _alternate_index)
+					elif isinstance(substitution, LigSubstitution):
+						tokens, jump, posses = substitution.apply(tokens, pos, font, self, run)
+					else:
+						tokens, jump, posses = substitution.apply(tokens, pos, font, self)
+					output_count = len(tokens) - len(before) + len(posses)
+					run.substitute(before, tokens, posses,
+						multiple=isinstance(substitution, MultSubstitution),
+						ligature=isinstance(substitution, LigSubstitution))
+					for sequence in _sequences:
+						sequence.update(posses, output_count)
+				index = '/'.join([str(self.index)] + [child['index'] for child in children])
+				application = {'index': index, 'posses': posses, 'rule': substitution,
+					'before': before, 'tokens': tokens, 'children': children,
+					'before_glyph_infos': before_infos, 'glyph_infos': tuple(run.infos)}
 				return tokens, application, jump
 		return tokens, None, 0
 
@@ -312,138 +373,16 @@ class SingleAdjustment:
 	def __str__(self):
 		return ' '.join([str((g,a)) for (g,a) in self.adjustments])
 
-# Type 4
-class MarkBaseAttachment:
-	def __init__(self, marks, bases):
-		self.marks = marks
-		self.bases = bases
-
-	def length(self):
-		return 2
-
-	def recur(self):
-		return None
-
-	def applicable(self, tokens, pos, font, lookup):
-		mark_index = self.mark(tokens, pos, font, lookup)
-		pos_base, base_index = self.base(tokens, pos, font, lookup)
-		return mark_index >= 0 and base_index >= 0
-
-	def apply(self, tokens, positionings, pos, font, lookup):
-		positionings = positionings.copy()
-		mark_index = self.mark(tokens, pos, font, lookup)
-		pos_base, base_index = self.base(tokens, pos, font, lookup)
-		mark = self.marks[mark_index]
-		base = self.bases[base_index]
-		cl = mark['class']
-		# positionings[pos_base]['XCoordinate'] = mark['x']
-		# positionings[pos_base]['YCoordinate'] = mark['y']
-		positionings[pos]['XCoordinate'] = base['coordinates'][cl]['x'] - mark['x']
-		positionings[pos]['YCoordinate'] = base['coordinates'][cl]['y'] - mark['y']
-		return positionings
-
-	def mark(self, tokens, pos, font, lookup):
-		for index, mark in enumerate(self.marks):
-			if mark['glyph'] == tokens[pos]:
-				return index
-		return -1
-
-	def base(self, tokens, pos, font, lookup):
-		pref = tokens[:pos]
-		pos_base = first_filtered_right(pref, lambda t : font.glyph_to_class[t] == BASE_GLYPH)
-		if pos_base >= 0:
-			for index, base in enumerate(self.bases):
-				if base['glyph'] == tokens[pos_base]:
-					return pos_base, index 
-		return -1, -1
-
-	def __str__(self):
-		return '(1) ' + self.marks + ' (2) ', self.bases
-
-# Type 6
-class MarkMarkAttachment:
-	def __init__(self, marks1, marks2):
-		self.marks1 = marks1
-		self.marks2 = marks2
-
-	def length(self):
-		return 2
-
-	def recur(self):
-		return None
-
-	def applicable(self, tokens, pos, font, lookup):
-		mark1_index = self.mark1(tokens, pos, font, lookup)
-		pos_mark2, mark2_index = self.mark2(tokens, pos, font, lookup)
-		return mark1_index >= 0 and mark2_index >= 0
-
-	def apply(self, tokens, positionings, pos, font, lookup):
-		positionings = [d.copy() for d in positionings]
-		mark1_index = self.mark1(tokens, pos, font, lookup)
-		pos_mark2, mark2_index = self.mark2(tokens, pos, font, lookup)
-		mark1 = self.marks1[mark1_index]
-		mark2 = self.marks2[mark2_index]
-		cl = mark1['class']
-		# positionings[pos_mark2]['XCoordinate'] = mark1['x']
-		# positionings[pos_mark2]['YCoordinate'] = mark1['y']
-		positionings[pos]['XCoordinate'] = mark2['coordinates'][cl]['x'] - mark1['x']
-		positionings[pos]['YCoordinate'] = mark2['coordinates'][cl]['y'] - mark1['y']
-		return positionings
-
-	def mark1(self, tokens, pos, font, lookup):
-		for index, mark in enumerate(self.marks1):
-			if mark['glyph'] == tokens[pos]:
-				return index
-		return -1
-
-	def mark2(self, tokens, pos, font, lookup):
-		pref = tokens[:pos]
-		pos_mark2 = first_filtered_right(pref, lambda t : filter_glyph(t, font, lookup))
-		if pos_mark2 >= 0:
-			for index, mark in enumerate(self.marks2):
-				if mark['glyph'] == tokens[pos_mark2]:
-					return pos_mark2, index 
-		return -1, -1
-
-	def __str__(self):
-		return '(1) ' + self.marks1 + ' (2) ' + self.marks2
-
-# Type 8
-class ChainPos:
-	def __init__(self, left, input, right, output):
-		self.left = left
-		self.input = input
-		self.right = right
-		self.output = output
-
-	def length(self):
-		return len(self.left) + 1 + len(self.right)
-
-	def recur(self):
-		return self.output
-
-	def applicable(self, tokens, pos, font, lookup):
-		return tokens[pos] in self.input and \
-			is_suffix_of(self.left, filter_list(tokens[:pos], \
-				lambda t : filter_glyph(t, font, lookup))) and \
-			is_prefix_of(self.input + self.right, filter_list(tokens[pos:], \
-				lambda t : filter_glyph(t, font, lookup)))
-
-	def apply(self, tokens, positionings, pos, font, lookup):
-		return positionings
-
-	def __str__(self):
-		return self.left + ' ' + self.input + ' ' + self.right + ' ' + self.output
-
 class GPOS_Lookup:
 	def __init__(self, index, typ):
 		self.index = index
 		self.typ = typ
+		self.right_to_left = False
 		self.ignore_base_glyphs = False
 		self.ignore_ligatures = False
 		self.ignore_marks = False
 		self.mark_class = 0
-		self.filter_set = None
+		self.filter_set: int | None = None
 		self.positionings = []
 
 	def add_positioning(self, positioning):
@@ -454,35 +393,170 @@ class GPOS_Lookup:
 	def reorder(self):
 		self.positionings = sorted(self.positionings, key=lambda s : s.length())
 
-	def apply(self, tokens, positionings, font):
+	def apply(self, tokens, positionings, font, *, attachments=None, glyph_infos=None, direction="ltr"):
+		validate_direction(direction)
+		self.ensure_supported()
+		if len(tokens) != len(positionings):
+			raise ValueError("Positioning needs one record per glyph")
+		glyph_infos = GlyphRun(tokens, font.glyph_to_class).infos if glyph_infos is None else glyph_infos
+		if len(glyph_infos) != len(tokens):
+			raise ValueError("Positioning provenance needs one record per glyph")
+		standalone = attachments is None
+		attachments = {} if standalone else attachments
 		applications = []
-		for pos in range(len(tokens)):
-			positionings, application = self.apply_at(tokens, positionings, pos, font)
-			if application is not None:
+		pos = 0
+		while pos < len(tokens):
+			positionings, application, jump = self.apply_at(
+				tokens, positionings, pos, font, attachments=attachments, glyph_infos=glyph_infos,
+				direction=direction)
+			if application is None:
+				pos += 1
+			else:
 				applications.append(application)
-		return positionings, applications
+				pos += jump
+		return (resolve_positions(positionings, attachments, direction=direction) if standalone else positionings), applications
 
-	def apply_at(self, tokens, positionings, pos, font):
-		for posit in sorted(self.positionings, key=lambda s : s.length()):
-			if posit.applicable(tokens, pos, font, self):
-				recur = posit.recur()
-				if recur is not None:
-					recur_lookup = font.GPOS[recur]
-					positionings, application = recur_lookup.apply_at(tokens, positionings, pos, font)
-					application['index'] = str(self.index) + '/' + application['index']
-				else:
-					positionings = posit.apply(tokens, positionings, pos, font, self)
-					application = {'index': str(self.index), 'posses': [pos], 'rule': posit, \
-						'tokens': tokens, 'positionings': positionings}
-				return positionings, application
-		return positionings, None
+	def apply_at(self, tokens, positionings, pos, font, *, attachments=None, glyph_infos=None, _depth=0, direction="ltr"):
+		validate_direction(direction)
+		if _depth >= 64:
+			raise ValueError("Contextual positioning recursion exceeds 64 levels")
+		self.ensure_supported()
+		if len(tokens) != len(positionings):
+			raise ValueError("Positioning needs one record per glyph")
+		glyph_infos = GlyphRun(tokens, font.glyph_to_class).infos if glyph_infos is None else glyph_infos
+		if len(glyph_infos) != len(tokens):
+			raise ValueError("Positioning provenance needs one record per glyph")
+		def eligible(p):
+			return filter_glyph(tokens[p], font, self, glyph_class=glyph_infos[p].glyph_class)
+		# Nested lookup entry is fixed by SequenceIndex, not the child's scan flags.
+		if not 0 <= pos < len(tokens) or (_depth == 0 and not eligible(pos)):
+			return positionings, None, 0
+		standalone = attachments is None
+		attachments = {} if standalone else attachments
+		second = None
+		typ = self.typ.split('/')[-1]
+		if typ == '2':
+			second = next((p for p in range(pos + 1, len(tokens))
+				if filter_glyph(tokens[p], font, self, glyph_class=glyph_infos[p].glyph_class)), None)
+		elif typ == '3':
+			second = next((p for p in range(pos - 1, -1, -1) if eligible(p)), None)
+		elif typ == '6':
+			for parent in range(pos - 1, -1, -1):
+				# Base/ligature ignore flags must not bridge separate mark runs.
+				if glyph_infos[parent].glyph_class != MARK_GLYPH:
+					break
+				if filter_glyph(tokens[parent], font, self, glyph_class=glyph_infos[parent].glyph_class):
+					if glyph_infos[pos].compatible_mark(glyph_infos[parent]):
+						second = parent
+					break
+		for positioning in self.positionings:
+			if isinstance(positioning, ContextPositioning):
+				posses = positioning.match_positions(tokens, pos, eligible)
+				if posses is None or not GlyphRun.match_components(
+						glyph_infos, posses, lambda p: not eligible(p), allow_ignored_parent=False):
+					continue
+				before = resolve_positions(positionings, attachments, direction=direction)
+				before_attachments = attachments.copy()
+				children = []
+				for sequence_index, lookup_index in positioning.refs:
+					if lookup_index not in font.GPOS_lookups:
+						raise ValueError("Unknown contextual positioning lookup index: " + str(lookup_index))
+					child_lookup = font.GPOS_lookups[lookup_index]
+					positionings, child, _ = child_lookup.apply_at(
+						tokens, positionings, posses[sequence_index], font,
+						attachments=attachments, glyph_infos=glyph_infos, _depth=_depth + 1,
+						direction=direction)
+					if child is not None:
+						children.append(child)
+				application = positioning_application(
+					index='/'.join([str(self.index)] + [child['index'] for child in children]),
+					tokens=tokens, posses=posses, rule=positioning, before=before,
+					after=resolve_positions(positionings, attachments, direction=direction), children=children,
+					before_attachments=before_attachments, attachments=attachments, direction=direction)
+				application['glyph_infos'] = tuple(glyph_infos)
+				# Child cursor advancement never changes the outer matched input span.
+				return (resolve_positions(positionings, attachments, direction=direction) if standalone else positionings), application, posses[-1] + 1 - pos
+			if isinstance(positioning, CursivePositioning):
+				anchors = positioning.match(tokens, pos, second)
+				if anchors is None or second is None:
+					continue
+				before = resolve_positions(positionings, attachments, direction=direction)
+				before_attachments = attachments.copy()
+				positionings = apply_cursive_attachment(
+					positionings, attachments, second, pos, *anchors,
+					direction=direction, right_to_left=self.right_to_left)
+				application = positioning_application(
+					index=str(self.index), tokens=tokens, posses=(second, pos), rule=positioning,
+					before=before, after=resolve_positions(positionings, attachments, direction=direction),
+					before_attachments=before_attachments, attachments=attachments, direction=direction)
+				application['glyph_infos'] = tuple(glyph_infos)
+				return (resolve_positions(positionings, attachments, direction=direction) if standalone else positionings), application, 1
+			if not isinstance(positioning, (SinglePositioning, PairPositioning, MarkPositioning, LigaturePositioning)):
+				raise NotImplementedError("Unsupported GPOS positioning rule")
+			if typ in ('4', '5'):
+				if not isinstance(positioning, (MarkPositioning, LigaturePositioning)):
+					raise ValueError("GPOS attachment lookup requires an attachment rule")
+				second = None
+				for parent in range(pos - 1, -1, -1):
+					info = glyph_infos[parent]
+					if info.glyph_class == MARK_GLYPH:
+						continue
+					previous = glyph_infos[parent - 1] if parent else None
+					if info.accepts_attachment(previous, ligature=typ == '5') or tokens[parent] in positioning.parents:
+						second = parent
+						break
+			if isinstance(positioning, LigaturePositioning):
+				component = 0
+				if second is not None and glyph_infos[second].ligature_id and \
+						glyph_infos[second].ligature_id == glyph_infos[pos].ligature_id:
+					component = glyph_infos[pos].component
+				match = positioning.match(tokens, pos, second, component)
+			else:
+				match = positioning.match(tokens, pos, second)
+			if match is None:
+				continue
+			before = resolve_positions(positionings, attachments, direction=direction)
+			before_attachments = attachments.copy()
+			positionings = positionings.copy()
+			posses = [index for index, _ in match.adjustments]
+			if match.attachment is not None:
+				# Attachment replaces earlier placement, but not the mark's advance.
+				position = positionings[pos]
+				positionings[pos] = GlyphPosition(position.x_advance, position.y_advance)
+				attachment = match.attachment
+				# Horizontal mark attachment snapshots the cross-stream position.
+				parent_y = resolve_origins(before, direction=direction)[attachment.parent][1]
+				attachments[pos] = GlyphAttachment(
+					attachment.parent, attachment.x_offset, attachment.y_offset, parent_y)
+				posses.append(pos)
+			for index, value in match.adjustments:
+				# YAdvance is only used for vertical layout, which is not yet supported.
+				positionings[index] = positionings[index].adjusted(
+					x_advance=value.x_advance,
+					x_offset=value.x_offset, y_offset=value.y_offset)
+			application = positioning_application(
+				index=str(self.index), tokens=tokens,
+				posses=posses, rule=positioning, before=before,
+				after=resolve_positions(positionings, attachments, direction=direction),
+				before_attachments=before_attachments, attachments=attachments, direction=direction)
+			application['glyph_infos'] = tuple(glyph_infos)
+			if match.component is not None:
+				application['ligature_component'] = match.component + 1
+			return (resolve_positions(positionings, attachments, direction=direction) if standalone else positionings), application, match.next_pos - pos
+		return positionings, None, 0
+
+	def ensure_supported(self):
+		if self.typ.split('/')[-1] not in ('1', '2', '3', '4', '5', '6', '7', '8'):
+			raise NotImplementedError("GPOS lookup " + str(self.index) + " (type " +
+				str(self.typ) + ") is unsupported")
 
 	def __str__(self):
 		s = ' GPOS LOOKUP ' + str(self.index)
 		if self.filter_set:
 			s += str(self.filter_set)
 		for posit in self.positionings:
-			s += posit
+			s += '\n' + str(posit)
+		return s
 
 class Feature:
 	def __init__(self, tag):
@@ -632,44 +706,56 @@ class Font:
 			feat.add_lookup_index(index)
 		return lookup
 
-	def apply(self, tokens, suppressed=[]):
+	def apply(self, tokens, suppressed=[], *, feature_values=None, direction="ltr"):
+		validate_direction(direction)
+		feature_values = {} if feature_values is None else feature_values
+		for tag, value in feature_values.items():
+			if not isinstance(value, int) or value < 0:
+				raise ValueError("Feature value for " + str(tag) + " must be a nonnegative integer")
 		applications = []
+		run = GlyphRun(tokens, self.glyph_to_class)
 		for lookup in self.GSUB_lookup_list:
-			if lookup.index in self.GSUB_lookup_index_to_feature:
-				tag = self.GSUB_lookup_index_to_feature[lookup.index].tag
-				if tag not in suppressed:
-					tokens, applications_lookup = lookup.apply(tokens, self)
-					for a in applications_lookup:
-						a['feature'] = tag
-						applications.append(a)
-		positionings = [{} for t in tokens]
+			tags = [feature.tag for feature in self.GSUB_features
+				if lookup.index in feature.lookup_indexes and feature.tag not in suppressed
+				and feature_values.get(feature.tag, 1) != 0]
+			if tags:
+				tokens, applications_lookup = lookup.apply(
+					tokens, self, alternate_index=feature_values.get(tags[0], 1), run=run)
+				for a in applications_lookup:
+					a['feature'] = tags[0]
+					applications.append(a)
+		positionings = self.initial_positions(tokens)
+		attachments = {}
 		for lookup in self.GPOS_lookup_list:
-			if lookup.index in self.GPOS_lookup_index_to_feature:
-				tag = self.GPOS_lookup_index_to_feature[lookup.index].tag
-				if tag not in suppressed:
-					positionings, applications_lookup = lookup.apply(tokens, positionings, self)
-					for a in applications_lookup:
-						a['feature'] = tag
-						applications.append(a)
-		return tokens, positionings, applications
+			tags = [feature.tag for feature in self.GPOS_features
+				if lookup.index in feature.lookup_indexes and feature.tag not in suppressed
+				and feature_values.get(feature.tag, 1) != 0]
+			if tags:
+				positionings, applications_lookup = lookup.apply(
+					tokens, positionings, self, attachments=attachments, glyph_infos=run.infos,
+					direction=direction)
+				for a in applications_lookup:
+					a['feature'] = tags[0]
+					applications.append(a)
+		return tokens, resolve_positions(positionings, attachments, direction=direction), applications
 
-	def shape(self, tokens, positionings):
-		places = [(0,0)]
-		x_ref = self.width[tokens[0]]
-		y_ref = 0
-		x = 0
-		y = 0
-		for pos in positionings[1:]:
-			if 'XCoordinate' in pos:
-				x = x + pos['XCoordinate']
-			if 'YCoordinate' in pos:
-				y = y + pos['YCoordinate']
-			places.append((-x_ref + x, y_ref + y))
-		return places
+	def initial_positions(self, tokens):
+		for token in tokens:
+			if token not in self.width:
+				raise ValueError("Missing horizontal advance for glyph: " + token)
+		return [GlyphPosition(x_advance=self.width[token]) for token in tokens]
 
-	def render(self, tokens, suppressed=[]):
-		tokens, positionings, applications = self.apply(tokens, suppressed=suppressed)
-		return tokens, positionings, applications, self.shape(tokens, positionings)
+	def shape(self, tokens, positionings, *, attachments=None, direction="ltr"):
+		if len(tokens) != len(positionings):
+			raise ValueError("Positioning needs one record per glyph")
+		if any(not isinstance(position, GlyphPosition) for position in positionings):
+			raise TypeError("Positioning records must be GlyphPosition instances, not legacy dictionaries")
+		return resolve_origins(positionings, attachments, direction=direction)
+
+	def render(self, tokens, suppressed=[], *, feature_values=None, direction="ltr"):
+		tokens, positionings, applications = self.apply(
+			tokens, suppressed=suppressed, feature_values=feature_values, direction=direction)
+		return tokens, positionings, applications, self.shape(tokens, positionings, direction=direction)
 
 	def __str__(self):
 		s = ''
@@ -700,6 +786,8 @@ class Simulator:
 	def __init__(self, font):
 		self.font = font
 		self.suppressed = []
+		self.feature_values = {}
+		self.direction = "ltr"
 		self.in_tokens = []
 		self.tokens = []
 		self.positionings = []
@@ -709,7 +797,8 @@ class Simulator:
 	def set_tokens(self, tokens):
 		self.in_tokens = tokens
 		self.tokens, self.positionings, self.applications, self.places = \
-			self.font.render(tokens, suppressed=self.suppressed)
+			self.font.render(tokens, suppressed=self.suppressed, feature_values=self.feature_values,
+				direction=self.direction)
 
 	def set_string(self, string):
 		self.in_tokens = self.font.string_to_tokens(string)
@@ -732,10 +821,7 @@ class Simulator:
 				for index, (t, p) in enumerate(zip(a['tokens'], a['positionings'])):
 					if index == a['posses'][0]:
 						s += '> '
-					if len(p) == 0:
-						s += t + ' '
-					else:
-						s += t + '(' + str(p.items()) + ')\n'
+					s += t + '(' + str(p) + ')\n'
 				s += '\n'
 			s += '\n'
 		return s
